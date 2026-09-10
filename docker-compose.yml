@@ -64,28 +64,6 @@ services:
               device_ids: ["0"]
               capabilities: [gpu]
 
-  worker-backend-1:
-    <<: *worker-backend-base
-    container_name: minicpm-wb-1
-    environment:
-      GPU_ID: "0"
-      BACKEND_PORT: "22500"
-      WORKER_PORT: "22400"
-      MODEL_PATH: /models/MiniCPM-o-4_5
-      GATEWAY_REGISTRY_URL: "http://gateway:8007/internal/workers"
-      WORKER_ID: "worker-backend-1"
-      WORKER_ENDPOINT: "worker-backend-1:22400"
-      WORKER_GPU_GROUP: "gpu-1"
-    volumes:
-      - ${MODEL_HOST_PATH:?set MODEL_HOST_PATH to the host model dir}:/models/MiniCPM-o-4_5:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["1"]
-              capabilities: [gpu]
-
   gateway:
     build:
       context: .

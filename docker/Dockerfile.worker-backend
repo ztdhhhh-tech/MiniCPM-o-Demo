@@ -35,16 +35,19 @@ WORKDIR /app
 # 6.3G 大头（torch+nvidia+triton），用 BuildKit 缓存挂载，跨 build 复用已下载 wheel。
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
-        --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.8.0 torchaudio==2.8.0
+        --index-url https://download.pytorch.org/whl/cu130 \
+        torch==2.11.0 torchaudio==2.11.0
 
 # ---- ② 其余轻依赖（~1G），requirements 变才重跑 ----
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "minicpmo-utils[all]>=1.0.5" \
-    && grep -vE '^[[:space:]]*minicpmo-utils(\[all\])?>=' requirements.txt > /tmp/requirements-worker.txt \
+    pip install --no-deps "minicpmo-utils>=1.0.5" \
+    && pip install "pillow==10.4.0" "einops>=0.8.0" "onnx>=1.16.0" "onnxruntime>=1.18.0" "stepaudio2-minicpmo==0.1.1" "torchcodec==0.11.1" "nvidia-npp==13.1.2.81" \
+    && grep -v 'minicpmo-utils' requirements.txt > /tmp/requirements-worker.txt \
     && pip install -r /tmp/requirements-worker.txt \
     && rm /tmp/requirements-worker.txt
+
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
 
 # ---- ③ 代码放最后：最常变，但只影响这一层；前两层全命中缓存 ----
 COPY . .
