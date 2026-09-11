@@ -13,9 +13,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -31,6 +32,7 @@ from py_backend.chat_util import (
     parse_raw_messages,
     parse_worker_chat_request_message,
 )
+from core.telemetry import LatencyCollector, JsonlLatencyWriter, TraceContext, get_latency_mode
 
 
 logger = logging.getLogger("backend_server")
@@ -121,6 +123,15 @@ def _result_metrics(result: Any, base: Optional[Dict[str, Any]] = None) -> Dict[
         value = getattr(result, attr, None)
         if value is not None:
             metrics[key] = value
+    latency = getattr(result, "latency", None)
+    if latency:
+        if hasattr(latency, "model_dump"):
+            latency = latency.model_dump(exclude_none=True)
+        elif hasattr(latency, "dict"):
+            latency = latency.dict(exclude_none=True)
+        latency_metrics = latency.get("metrics") if isinstance(latency, dict) else None
+        if isinstance(latency_metrics, dict):
+            metrics.update(latency_metrics)
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -169,11 +180,32 @@ class BackendProtocolSession:
         self._active_response_id: Optional[str] = None
         self._usage = SessionUsage()
         self._usage_chunk_index = 0
+        self._unit_index = 0
+        self._output_seq = 0
+        self._last_audio_emit_t: Optional[float] = None
+        self._last_finalize_meta: Optional[Dict[str, Any]] = None
+        self._latency_writer = JsonlLatencyWriter(session_id)
 
     async def send(self, event_type: str, **fields: Any) -> None:
+        send_t0 = time.perf_counter()
         data = {"type": event_type, **{k: v for k, v in fields.items() if v is not None}}
         data["server_send_ts"] = time.time()
         await self.ws.send_json(data)
+        send_ms = (time.perf_counter() - send_t0) * 1000
+        if get_latency_mode() != "off":
+            self._latency_writer.write({
+                "event": "transport.ws_send",
+                "session_id": self.session_id,
+                "type": event_type,
+                "duration_ms": round(send_ms, 3),
+            })
+        if get_latency_mode() != "off" and send_ms >= 1.0:
+            logger.info(
+                "[Latency] event=%s session=%s ws_send_ms=%.3f",
+                event_type,
+                self.session_id,
+                send_ms,
+            )
 
     async def send_output_delta(self, kind: str, **fields: Any) -> None:
         await self.send("response.output.delta", kind=kind, **fields)
@@ -228,6 +260,7 @@ class BackendProtocolSession:
                 )
         with suppress(Exception):
             await self.ws.close(code=1000, reason=reason)
+        self._latency_writer.close()
         await self.state.forget(self.session_id)
 
     async def fatal(self, reason: str, *, message: Optional[str] = None) -> None:
@@ -406,15 +439,32 @@ class BackendProtocolSession:
         )
 
     async def _push_full_duplex(self, payload: Dict[str, Any]) -> None:
+        request_t0 = time.perf_counter()
         async with self._op_lock:
-            await self._wait_finalize()
+            op_lock_wait_ms = (time.perf_counter() - request_t0) * 1000
             input_id = payload.get("input_id")
+            self._unit_index += 1
+            trace_context = TraceContext.create(
+                self.session_id,
+                self._usage_chunk_index,
+                str(input_id or f"in_{self._unit_index}"),
+                self._unit_index,
+            )
+            trace = LatencyCollector(trace_context)
+            finalize_t0 = time.perf_counter()
+            await self._wait_finalize()
+            previous_finalize_wait_ms = (time.perf_counter() - finalize_t0) * 1000
+            trace.metric("op_lock_wait_ms", round(op_lock_wait_ms, 3))
+            trace.metric("previous_finalize_wait_ms", round(previous_finalize_wait_ms, 3))
             audio_base64 = _extract_audio_base64(payload)
             if not audio_base64:
                 raise RuntimeError("full_duplex input requires audio")
 
+            decode_t0 = time.perf_counter()
             audio_waveform = decode_audio_base64(audio_base64)
             decoded_frames = decode_frame_base64_list(_extract_frame_base64_list(payload))
+            trace.metric("decode_input_ms", round((time.perf_counter() - decode_t0) * 1000, 3))
+            trace.metric("receive_ms", round((time.perf_counter() - request_t0) * 1000, 3))
             hints = _first_dict(payload.get("hints"))
             force_listen = bool(_coalesce(payload.get("force_listen"), hints.get("force_listen"), default=False))
             max_slice_nums = int(_coalesce(payload.get("max_slice_nums"), hints.get("max_slice_nums"), default=1))
@@ -422,14 +472,36 @@ class BackendProtocolSession:
             t0 = time.perf_counter()
 
             def _duplex_step() -> tuple[Any, float, Dict[str, Any], Dict[str, Any]]:
-                prefill_t0 = time.perf_counter()
-                prefill_result = self.backend.duplex_prefill(
-                    audio_waveform=audio_waveform,
-                    frame_list=decoded_frames.frame_list,
-                    max_slice_nums=max_slice_nums,
-                )
-                prefill_ms = (time.perf_counter() - prefill_t0) * 1000
-                result = self.backend.duplex_generate(force_listen=force_listen)
+                profiler = None
+                profiler_cm = nullcontext()
+                if get_latency_mode() == "profile":
+                    try:
+                        import torch
+                        from torch.profiler import ProfilerActivity, profile
+
+                        activities = [ProfilerActivity.CPU]
+                        if torch.cuda.is_available():
+                            activities.append(ProfilerActivity.CUDA)
+                        profiler_cm = profile(activities=activities, record_shapes=False)
+                    except Exception:
+                        logger.exception("unable to start torch.profiler")
+                with profiler_cm as profiler:
+                    prefill_t0 = time.perf_counter()
+                    prefill_result = self.backend.duplex_prefill(
+                        audio_waveform=audio_waveform,
+                        frame_list=decoded_frames.frame_list,
+                        max_slice_nums=max_slice_nums,
+                        latency_trace=trace,
+                    )
+                    prefill_ms = (time.perf_counter() - prefill_t0) * 1000
+                    result = self.backend.duplex_generate(force_listen=force_listen, latency_trace=trace)
+                if profiler is not None and hasattr(profiler, "export_chrome_trace"):
+                    profile_path = os.path.join(
+                        os.getenv("MINICPM_LATENCY_LOG_DIR", "logs/duplex_latency"),
+                        f"{trace_context.trace_id}.chrome.json",
+                    )
+                    os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+                    profiler.export_chrome_trace(profile_path)
                 return result, prefill_ms, prefill_result, self._safe_metrics()
 
             result, prefill_ms, prefill_result, backend_metrics = await asyncio.to_thread(_duplex_step)
@@ -437,6 +509,20 @@ class BackendProtocolSession:
             metrics = _result_metrics(result, backend_metrics)
             metrics["prefill_ms"] = round(prefill_ms, 1)
             metrics["wall_clock_ms"] = round(wall_clock_ms, 1)
+            metrics["op_lock_wait_ms"] = round(op_lock_wait_ms, 1)
+            metrics["previous_finalize_wait_ms"] = round(previous_finalize_wait_ms, 1)
+            if self._last_finalize_meta:
+                metrics["previous_finalize_wall_ms"] = self._last_finalize_meta.get("finalize_wall_ms")
+            latency_payload = getattr(result, "latency", None)
+            if latency_payload:
+                if hasattr(latency_payload, "model_dump"):
+                    latency_payload = latency_payload.model_dump(exclude_none=True)
+                elif hasattr(latency_payload, "dict"):
+                    latency_payload = latency_payload.dict(exclude_none=True)
+                metrics["latency"] = latency_payload
+                metrics["trace_id"] = trace_context.trace_id
+                metrics["unit_id"] = trace_context.unit_id
+                metrics["input_chunk_id"] = trace_context.input_chunk_id
             if isinstance(prefill_result, dict):
                 n_vision_slices = prefill_result.get(
                     "n_vision_slices",
@@ -475,10 +561,19 @@ class BackendProtocolSession:
                     response_id=self._active_response_id,
                     input_id=input_id,
                     metrics=metrics,
+                    trace_id=trace_context.trace_id,
+                    unit_id=trace_context.unit_id,
                     **take_usage_fields(),
                 )
                 self._active_response_id = None
-                self._schedule_finalize()
+                if get_latency_mode() != "off":
+                    self._latency_writer.write({
+                        "event": "backend.unit.done",
+                        **trace_context.as_dict(),
+                        "metrics": metrics,
+                        "finalize": self._last_finalize_meta,
+                    })
+                self._schedule_finalize(trace_context)
                 return
 
             if self._active_response_id is None:
@@ -492,18 +587,58 @@ class BackendProtocolSession:
                     input_id=input_id,
                     text=result.text,
                     metrics=metrics,
+                    trace_id=trace_context.trace_id,
+                    unit_id=trace_context.unit_id,
                     **take_usage_fields(),
                 )
             if result.audio_data:
+                self._output_seq += 1
+                audio_metrics = dict(metrics)
+                audio_metrics["output_seq"] = self._output_seq
+                now_emit = time.perf_counter()
+                interval_ms = (
+                    (now_emit - self._last_audio_emit_t) * 1000
+                    if self._last_audio_emit_t is not None else None
+                )
+                self._last_audio_emit_t = now_emit
+                try:
+                    pcm_samples = len(base64.b64decode(result.audio_data)) // 4
+                except Exception:
+                    pcm_samples = 0
+                pcm_duration_ms = pcm_samples / 24000 * 1000
+                if interval_ms and interval_ms > 0:
+                    audio_metrics["output_interval_ms"] = round(interval_ms, 3)
+                    audio_metrics["audio_supply_ratio"] = round(pcm_duration_ms / interval_ms, 3)
+                audio_metrics["pcm_samples"] = pcm_samples
+                audio_metrics["pcm_sample_rate"] = 24000
+                audio_metrics["pcm_duration_ms"] = round(pcm_duration_ms, 3)
+                if isinstance(audio_metrics.get("latency"), dict):
+                    audio_metrics["latency"] = {
+                        **audio_metrics["latency"],
+                        "output_seq": self._output_seq,
+                        "pcm_samples": pcm_samples,
+                        "pcm_sample_rate": 24000,
+                        "pcm_duration_ms": round(pcm_duration_ms, 3),
+                    }
                 await self.send_output_delta(
                     "audio",
                     session_id=self.session_id,
                     response_id=self._active_response_id,
                     input_id=input_id,
                     audio=result.audio_data,
-                    metrics=metrics,
+                    metrics=audio_metrics,
+                    trace_id=trace_context.trace_id,
+                    unit_id=trace_context.unit_id,
+                    output_seq=self._output_seq,
                     **take_usage_fields(),
                 )
+                if get_latency_mode() != "off":
+                    self._latency_writer.write({
+                        "event": "backend.audio.done",
+                        **trace_context.as_dict(),
+                        "output_seq": self._output_seq,
+                        "metrics": audio_metrics,
+                    })
             if result.end_of_turn:
                 await self.send_output_delta(
                     "listen",
@@ -511,11 +646,21 @@ class BackendProtocolSession:
                     response_id=self._active_response_id,
                     input_id=input_id,
                     metrics=metrics,
+                    trace_id=trace_context.trace_id,
+                    unit_id=trace_context.unit_id,
                     **take_usage_fields(),
                 )
                 self._active_response_id = None
 
-            self._schedule_finalize()
+            if get_latency_mode() != "off":
+                self._latency_writer.write({
+                    "event": "backend.unit.done",
+                    **trace_context.as_dict(),
+                    "metrics": metrics,
+                    "finalize": self._last_finalize_meta,
+                })
+
+            self._schedule_finalize(trace_context)
 
     def _safe_metrics(self) -> Dict[str, Any]:
         try:
@@ -531,15 +676,28 @@ class BackendProtocolSession:
             self._finalize_task.result()
             self._finalize_task = None
 
-    def _schedule_finalize(self) -> None:
+    def _schedule_finalize(self, trace_context: Optional[TraceContext] = None) -> None:
         if self._finalize_task is not None and not self._finalize_task.done():
             raise RuntimeError("duplex finalize already in flight")
 
         self._finalize_done.clear()
 
         async def _run() -> None:
+            t0 = time.perf_counter()
             try:
                 await asyncio.to_thread(self.backend.duplex_finalize)
+                finalize_ms = (time.perf_counter() - t0) * 1000
+                self._last_finalize_meta = {
+                    **(trace_context.as_dict() if trace_context else {}),
+                    "finalize_wall_ms": round(finalize_ms, 3),
+                }
+                if get_latency_mode() != "off":
+                    logger.info(
+                        "[Latency] event=backend.finalize.done session=%s unit=%s finalize_wall_ms=%.3f",
+                        self.session_id,
+                        trace_context.unit_id if trace_context else None,
+                        finalize_ms,
+                    )
             finally:
                 self._finalize_done.set()
 

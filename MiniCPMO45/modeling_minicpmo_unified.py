@@ -17,6 +17,7 @@
 import json
 import logging
 import math
+from contextlib import nullcontext
 import os
 import tempfile
 import threading
@@ -81,6 +82,7 @@ from .utils import torch_clone_recursive
 from .utils import TTSSamplingParams
 from .utils import TTSStreamingGenerator
 from .utils import StreamDecoder
+from core.telemetry import LatencyCollector
 
 logger = logging.getLogger(__name__)
 
@@ -1342,7 +1344,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
 
         return input_lengths_after_cnn, input_lengths_after_pooling
 
-    def get_vision_embedding(self, data):
+    def get_vision_embedding(self, data, latency_trace: Optional[LatencyCollector] = None):
         if "vision_hidden_states" not in data:
             dtype = self.llm.model.embed_tokens.weight.dtype
             device = self.llm.model.embed_tokens.weight.device
@@ -1373,6 +1375,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
                     patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
 
                 vision_batch_size = self.config.vision_batch_size
+                vision_t0 = time.perf_counter()
                 all_pixel_values = all_pixel_values.type(dtype)
                 if B > vision_batch_size:
                     hs = []
@@ -1392,7 +1395,14 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
                         patch_attention_mask=patch_attn_mask,
                         tgt_sizes=tgt_sizes,
                     ).last_hidden_state
+                if latency_trace is not None and latency_trace.enabled:
+                    latency_trace.record("model.prefill.vision_encoder",
+                                         (time.perf_counter() - vision_t0) * 1000)
+                resampler_t0 = time.perf_counter()
                 vision_embedding = self.resampler(vision_embedding, tgt_sizes)
+                if latency_trace is not None and latency_trace.enabled:
+                    latency_trace.record("model.prefill.vision_resampler",
+                                         (time.perf_counter() - resampler_t0) * 1000)
 
                 start = 0
                 for pixel_values in pixel_values_list:
@@ -1464,6 +1474,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
         suffix_extra_frames=1,
         return_debug=False,
         cnn_min_length=None,
+        latency_trace: Optional[LatencyCollector] = None,
     ):
         """Extract audio embeddings in a streaming manner using cached key-value pairs.
 
@@ -1541,18 +1552,23 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
                 )
 
             # Step 1: APM processing
-            ret_apm = self.apm(
-                wavforms,
-                past_key_values=self.audio_past_key_values,
-                use_cache=True,
-                output_hidden_states=True,
-                attention_mask=audio_attention_mask,
-                use_extra_context=use_extra_context,
-                prefix_extra_frames=prefix_extra_frames,
-                suffix_extra_frames=suffix_extra_frames,
-                return_debug=return_debug,
-                cnn_min_length=cnn_min_length,
+            encoder_context = (
+                latency_trace.span("model.prefill.audio_encoder")
+                if latency_trace is not None else nullcontext()
             )
+            with encoder_context:
+                ret_apm = self.apm(
+                    wavforms,
+                    past_key_values=self.audio_past_key_values,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    attention_mask=audio_attention_mask,
+                    use_extra_context=use_extra_context,
+                    prefix_extra_frames=prefix_extra_frames,
+                    suffix_extra_frames=suffix_extra_frames,
+                    return_debug=return_debug,
+                    cnn_min_length=cnn_min_length,
+                )
             if return_debug:
                 audio_outputs, debug_info["apm_debug"] = ret_apm
             else:
@@ -1579,21 +1595,23 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
 
             self.audio_past_key_values = audio_outputs.past_key_values
 
-            # Step 2: Projection
-            audio_embeds = self.audio_projection_layer(audio_states)
+            # Step 2: Projection and pooling
+            projector_context = (
+                latency_trace.span("model.prefill.audio_projector_pool")
+                if latency_trace is not None else nullcontext()
+            )
+            with projector_context:
+                audio_embeds = self.audio_projection_layer(audio_states)
+                if return_debug:
+                    debug_info["after_projection"] = audio_embeds.clone()
+                audio_embeds = audio_embeds.transpose(1, 2)
+                audio_embeds = self.audio_avg_pooler(audio_embeds)
+                audio_embeds = audio_embeds.transpose(1, 2)
 
             # DEBUG: 打印 projection 和 pooling 后的 checksum
             if hasattr(self, "_debug_prefill") and self._debug_prefill:
                 proj_sum = audio_embeds.sum().item()
-                print(f"[DEBUG audio_embed] after_projection sum={proj_sum:.6f}, shape={audio_embeds.shape}")
-
-            if return_debug:
-                debug_info["after_projection"] = audio_embeds.clone()
-
-            # Step 3: Pooling
-            audio_embeds = audio_embeds.transpose(1, 2)
-            audio_embeds = self.audio_avg_pooler(audio_embeds)
-            audio_embeds = audio_embeds.transpose(1, 2)
+                print(f"[DEBUG audio_embed] after_projection_pool sum={proj_sum:.6f}, shape={audio_embeds.shape}")
 
             # DEBUG: 打印 pooling 后的 checksum
             if hasattr(self, "_debug_prefill") and self._debug_prefill:
@@ -3967,6 +3985,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
         audio_waveform: Optional[np.ndarray] = None,
         frame_list: Optional[List] = None,
         max_slice_nums: int = 1,
+        latency_trace: Optional[LatencyCollector] = None,
     ):
         """预填充用户输入（透传到 self.duplex.streaming_prefill）
         
@@ -3984,6 +4003,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
             audio_waveform=audio_waveform,
             frame_list=frame_list,
             max_slice_nums=max_slice_nums,
+            latency_trace=latency_trace,
         )
     
     def duplex_generate(
@@ -3998,6 +4018,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
         text_repetition_window_size: Optional[int] = None,
         length_penalty: float = 1.1,
         force_listen_override: bool = False,
+        latency_trace: Optional[LatencyCollector] = None,
     ):
         """生成响应（透传到 self.duplex.streaming_generate）
         
@@ -4029,6 +4050,7 @@ class MiniCPMO(MiniCPMOPreTrainedModel):
             text_repetition_window_size=text_repetition_window_size,
             length_penalty=length_penalty,
             force_listen_override=force_listen_override,
+            latency_trace=latency_trace,
         )
     
     def duplex_finalize(self):
@@ -4563,6 +4585,7 @@ class DuplexCapability:
         frame_list: Optional[list] = None,
         max_slice_nums: Union[int, List[int]] = 1,
         batch_vision_feed: bool = False,
+        latency_trace: Optional[LatencyCollector] = None,
     ):
         """Streaming prefill - called once per second, processing audio/video data
 
@@ -4599,6 +4622,7 @@ class DuplexCapability:
             )
 
         start_time = time.time()
+        trace = latency_trace or LatencyCollector()
         cost_vision_process = 0.0
         cost_vision_embed = 0.0
         cost_vision_feed = 0.0
@@ -4634,6 +4658,29 @@ class DuplexCapability:
                     "input_vision_tokens": 0,
                 },
             }
+            if trace.enabled:
+                if cost_vision_process:
+                    trace.record("model.prefill.vision_process", cost_vision_process * 1000,
+                                 image_count=len(frame_list or []), image_slices=n_vision_slices)
+                if cost_vision_feed:
+                    trace.record("model.prefill.vision_feed", cost_vision_feed * 1000,
+                                 image_slices=n_vision_slices)
+                if cost_audio_process:
+                    trace.record("model.prefill.audio_process", cost_audio_process * 1000)
+                if cost_audio_feed:
+                    trace.record("model.prefill.audio_feed", cost_audio_feed * 1000)
+                if cost_vision_feed or cost_audio_feed:
+                    trace.record("model.prefill.llm_prefill",
+                                 (cost_vision_feed + cost_audio_feed) * 1000)
+                trace.update({
+                    "audio_input_samples": len(audio_waveform) if audio_waveform is not None else 0,
+                    "audio_input_ms": (len(audio_waveform) / self.SAMPLE_RATE * 1000)
+                    if audio_waveform is not None else 0,
+                    "audio_tokens": usage_delta.get("input_audio_tokens", 0),
+                    "image_count": len(frame_list or []),
+                    "image_slices": n_vision_slices,
+                })
+                result["latency"] = trace.finish(resolve_gpu=False)
             return result
 
         if self.is_session_stop_set():
@@ -4723,7 +4770,10 @@ class DuplexCapability:
             # Get vision embeddings for all images (each may have multiple slices)
             # vision_hidden_states is a list, one entry per input image
             # Each entry contains embeddings for [source_image, slice_1, slice_2, ...]
-            vision_hidden_states = self.model.get_vision_embedding(processed_frames)
+            vision_hidden_states = self.model.get_vision_embedding(
+                processed_frames,
+                latency_trace=trace,
+            )
             cost_vision_embed = time.time() - t0
 
             if vision_hidden_states is not None and len(vision_hidden_states) > 0:
@@ -4925,6 +4975,7 @@ class DuplexCapability:
                 use_extra_context=batch_feature.use_extra_context,
                 prefix_extra_frames=batch_feature.prefix_extra_frames,
                 suffix_extra_frames=batch_feature.suffix_extra_frames,
+                latency_trace=trace,
             )
             audio_embeds = torch.cat([t for g in embeds_nested for t in g], dim=0)
             cost_audio_embed = time.time() - t0
@@ -4973,9 +5024,10 @@ class DuplexCapability:
         cost_token2wav: float = 0.0,
         n_tokens: int = 0,
         n_tts_tokens: int = 0,
+        latency: Optional[LatencyCollector] = None,
     ) -> dict:
         """构造 streaming_generate 的标准返回 dict"""
-        return {
+        payload = {
             "is_listen": is_listen,
             "text": text,
             "audio_waveform": audio_waveform if audio_waveform is not None else self._generate_silence_waveform(),
@@ -4993,6 +5045,17 @@ class DuplexCapability:
                 "output_audio_tokens": int(n_tts_tokens),
             },
         }
+        if latency is not None and latency.enabled:
+            latency.update({
+                "n_llm_tokens": n_tokens,
+                "n_tts_tokens": n_tts_tokens,
+                "pcm_samples": len(audio_waveform) if audio_waveform is not None else 0,
+                "pcm_sample_rate": 24000,
+                "pcm_duration_ms": (len(audio_waveform) / 24000 * 1000)
+                if audio_waveform is not None else 0,
+            })
+            payload["latency"] = latency.finish()
+        return payload
 
     @property
     def needs_finalize(self) -> bool:
@@ -5014,6 +5077,7 @@ class DuplexCapability:
         text_repetition_window_size=512,
         length_penalty=1.1,
         force_listen_override: bool = False,
+        latency_trace: Optional[LatencyCollector] = None,
     ):
         """生成响应。返回后必须调用 finalize_unit()（除非 needs_finalize 为 False）。
 
@@ -5022,15 +5086,16 @@ class DuplexCapability:
         - 模式 B（同步）: generate → finalize → 返回结果
         """
         start_time = time.time()
+        trace = latency_trace or LatencyCollector()
 
         if self.is_session_stop_set():
             self._pending_finalize = None  # 无需 finalize
-            return self._make_generate_result(start_time, end_of_turn=True)
+            return self._make_generate_result(start_time, end_of_turn=True, latency=trace)
 
         # check if there are pending logits to process
         if not hasattr(self, "pending_logits") or self.pending_logits is None:
             self._pending_finalize = None  # 无需 finalize
-            return self._make_generate_result(start_time)
+            return self._make_generate_result(start_time, latency=trace)
 
         # use pending logits generated in streaming_prefill
         logits = self.pending_logits
@@ -5068,6 +5133,8 @@ class DuplexCapability:
             _tts_pad_suppressed = True
 
         llm_start_time = time.time()
+        llm_decode_total_ms = 0.0
+        llm_feed_total_ms = 0.0
         _token_trace = []  # [DEBUG] 记录每个 token 的详细信息
         _pending_terminator_id = None  # 延迟 feed 的终止符，和 </unit> 合并
         _chunk_has_tts_pad = False
@@ -5100,6 +5167,7 @@ class DuplexCapability:
                     length_penalty=length_penalty,
                 )
                 _decode_ms = (time.time() - t_step) * 1000
+                llm_decode_total_ms += _decode_ms
 
                 # if current turn not ended, not allowed to listen (only check when not force_listen)
                 if last_id.item() == self.listen_token_id and (not self.current_turn_ended):
@@ -5150,6 +5218,7 @@ class DuplexCapability:
                 t_feed = time.time()
                 logits, hidden = self.decoder.feed(self.decoder.embed_token(last_id.item()), return_logits=True)
                 _feed_ms = (time.time() - t_feed) * 1000
+                llm_feed_total_ms += _feed_ms
 
                 assert len(hidden.shape) == 3
                 assert hidden.shape[0] == 1
@@ -5207,6 +5276,7 @@ class DuplexCapability:
             return self._make_generate_result(
                 start_time, cost_llm=cost_llm,
                 n_tokens=len(total_ids_in_unit),
+                latency=trace,
             )
 
         # 如果 unit 中出现了 tts_pad_id，传空列表给 TTS
@@ -5225,12 +5295,14 @@ class DuplexCapability:
                 start_time, is_listen=False, text=text,
                 end_of_turn=end_of_turn, cost_llm=cost_llm,
                 n_tokens=len(total_ids_in_unit),
+                latency=trace,
             )
 
         # TTS generate
         tts_start_time = time.time()
         tts_prep_start_time = time.time()
-        tts_condition = self._convert_results_to_tts_input(tts_hidden_in_unit)
+        with trace.span("model.generate.tts_prep") if trace is not None else nullcontext():
+            tts_condition = self._convert_results_to_tts_input(tts_hidden_in_unit)
         tts_prep_end_time = time.time()
 
         max_token_per_chunk = 25 + 1
@@ -5247,18 +5319,19 @@ class DuplexCapability:
         if self.tts_current_turn_start_time is None:
             self.tts_current_turn_start_time = current_time
 
-        new_tokens, old_kv = self.model.tts.generate_chunk(
-            inputs_embeds=tts_condition,
-            temperature=self.tts_temperature,
-            repetition_penalty=self.tts_repetition_penalty,
-            eos_token=self.tts_eos_token,
-            force_no_stop=False,
-            max_new_token=max_token_per_chunk,
-            min_new_tokens=min_token_per_chunk,
-            past_key_values=self.tts_past_key_values,
-            logits_processors=self.tts_logits_processors,
-            text_start_pos=self.tts_text_start_pos,
-        )
+        with trace.span("model.generate.tts_generate") if trace is not None else nullcontext():
+            new_tokens, old_kv = self.model.tts.generate_chunk(
+                inputs_embeds=tts_condition,
+                temperature=self.tts_temperature,
+                repetition_penalty=self.tts_repetition_penalty,
+                eos_token=self.tts_eos_token,
+                force_no_stop=False,
+                max_new_token=max_token_per_chunk,
+                min_new_tokens=min_token_per_chunk,
+                past_key_values=self.tts_past_key_values,
+                logits_processors=self.tts_logits_processors,
+                text_start_pos=self.tts_text_start_pos,
+            )
 
         tts_end_time = time.time()
 
@@ -5275,9 +5348,10 @@ class DuplexCapability:
         # Token2Wav 生成（必须在 reset 之前，否则 buffer 中倒数第二个 chunk 的 tokens 会丢失）
         token2wav_start_time = time.time()
         _buf_before = len(self.token2wav_buffer)
-        audio_waveform = self._generate_waveform_from_tokens(
-            new_tokens, prompt_wav_path, end_of_turn, force_flush=force_flush
-        )
+        with trace.span("model.generate.token2wav") if trace is not None else nullcontext():
+            audio_waveform = self._generate_waveform_from_tokens(
+                new_tokens, prompt_wav_path, end_of_turn, force_flush=force_flush
+            )
         _buf_after = len(self.token2wav_buffer)
         token2wav_end_time = time.time()
 
@@ -5296,6 +5370,21 @@ class DuplexCapability:
         if end_of_turn:
             self._reset_token2wav_for_new_turn()
 
+        if trace.enabled:
+            trace.record("model.generate.llm_generate", cost_llm * 1000,
+                         n_llm_tokens=len(total_ids_in_unit))
+            trace.record("model.generate.llm_decode", llm_decode_total_ms,
+                         n_llm_tokens=len(total_ids_in_unit))
+            trace.record("model.generate.llm_feed", llm_feed_total_ms,
+                         n_llm_tokens=len(total_ids_in_unit))
+            trace.update({
+                "token2wav_buffer_before": _buf_before,
+                "token2wav_buffer_after": _buf_after,
+                "force_flush": force_flush,
+                "end_of_turn": end_of_turn,
+                "audio_empty": audio_waveform is None or len(audio_waveform) == 0,
+            })
+
         return self._make_generate_result(
             start_time, is_listen=False, text=text,
             audio_waveform=audio_waveform, end_of_turn=end_of_turn,
@@ -5305,6 +5394,7 @@ class DuplexCapability:
             cost_token2wav=token2wav_end_time - token2wav_start_time,
             n_tokens=len(total_ids_in_unit),
             n_tts_tokens=new_tokens.numel(),
+            latency=trace,
         )
 
     @torch.no_grad()
@@ -5320,6 +5410,7 @@ class DuplexCapability:
             return
 
         t_start = time.time()
+        finalize_trace = LatencyCollector()
 
         # 1. 合并 feed：终止符（如有）+ </unit>
         unit_end_id = self.tokenizer.convert_tokens_to_ids("</unit>")
@@ -5347,6 +5438,14 @@ class DuplexCapability:
         self._pending_finalize = None
 
         finalize_ms = (time.time() - t_start) * 1000
+        if finalize_trace.enabled:
+            finalize_trace.record("model.finalize.total", finalize_ms)
+            finalize_trace.update({
+                "input_type": state["input_type"],
+                "is_listen": state["is_listen"],
+                "generated_tokens": len(state["total_ids_in_unit"]),
+            })
+            self._last_finalize_latency = finalize_trace.finish()
         logger.info(
             f"[Duplex] finalize_unit: {state['input_type']} is_listen={state['is_listen']} "
             f"finalize={finalize_ms:.0f}ms"

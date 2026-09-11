@@ -132,7 +132,7 @@ processor.prefill(new_audio_chunk)
 ```
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -411,6 +411,47 @@ class DuplexPrefillRequest(BaseModel):
 # 生成结果
 # =============================================================================
 
+class DuplexLatencyMetrics(BaseModel):
+    """Optional, backwards-compatible component latency payload."""
+
+    trace_id: Optional[str] = None
+    session_id: Optional[str] = None
+    turn_id: Optional[int] = None
+    input_chunk_id: Optional[str] = None
+    unit_id: Optional[int] = None
+    output_seq: Optional[int] = None
+
+    receive_ms: Optional[float] = None
+    decode_input_ms: Optional[float] = None
+    op_lock_wait_ms: Optional[float] = None
+    previous_finalize_wait_ms: Optional[float] = None
+    prefill_wall_ms: Optional[float] = None
+    generate_wall_ms: Optional[float] = None
+    finalize_wall_ms: Optional[float] = None
+    ws_send_ms: Optional[float] = None
+
+    audio_process_ms: Optional[float] = None
+    audio_encoder_ms: Optional[float] = None
+    audio_projector_pool_ms: Optional[float] = None
+    vision_process_ms: Optional[float] = None
+    vision_encoder_ms: Optional[float] = None
+    vision_resampler_ms: Optional[float] = None
+    llm_prefill_ms: Optional[float] = None
+    llm_generate_ms: Optional[float] = None
+    tts_prep_ms: Optional[float] = None
+    tts_generate_ms: Optional[float] = None
+    token2wav_ms: Optional[float] = None
+
+    n_llm_tokens: Optional[int] = None
+    n_tts_tokens: Optional[int] = None
+    pcm_samples: Optional[int] = None
+    pcm_sample_rate: Optional[int] = None
+    pcm_duration_ms: Optional[float] = None
+    spans: Optional[List[Dict[str, Any]]] = None
+    mode: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
+
+
 class DuplexGenerateResult(BaseModel):
     """双工生成结果（每次 generate 返回）
     
@@ -520,6 +561,10 @@ class DuplexGenerateResult(BaseModel):
     server_send_ts: Optional[float] = Field(
         None,
         description="服务端发送此 result 的时间戳（time.time()），用于全链路时延分析"
+    )
+    latency: Optional["DuplexLatencyMetrics"] = Field(
+        None,
+        description="诊断模式下的组件级时延信息"
     )
 
 

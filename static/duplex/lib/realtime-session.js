@@ -65,6 +65,8 @@ export class RealtimeSession {
                 pdelay: data.pdelay,
             });
         };
+        this.audioPlayer.onLatency = (data) => this.onLatency(data);
+        this.audioPlayer.onGap = (data) => this.onGap(data);
     }
 
     get running() { return this._started; }
@@ -82,6 +84,8 @@ export class RealtimeSession {
     async onPrepared() {}
     onCleanup() {}
     onMetrics(data) {}
+    onLatency(data) {}
+    onGap(data) {}
     onRunningChange(running) {}
     onForceListenChange(active) {}
     onPauseStateChange(state) {}
@@ -523,7 +527,12 @@ export class RealtimeSession {
 
         if (msg.audio) {
             if (!this.audioPlayer.turnActive) this.audioPlayer.beginTurn();
-            this.audioPlayer.playChunk(msg.audio, recvTime);
+            this.audioPlayer.playChunk(msg.audio, recvTime, {
+                traceId: msg.trace_id || msg.metrics?.trace_id || msg.metrics?.latency?.trace_id,
+                unitId: msg.unit_id ?? msg.metrics?.unit_id ?? msg.metrics?.latency?.unit_id,
+                outputSeq: msg.output_seq ?? msg.metrics?.output_seq ?? msg.metrics?.latency?.output_seq,
+                serverMetrics: msg.metrics || null,
+            });
         }
 
         const result = {

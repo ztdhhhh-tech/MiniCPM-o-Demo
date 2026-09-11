@@ -28,7 +28,7 @@ export class AudioPlayer {
         this._playing = false;
         this._sources = [];
         this._delayTimer = null;
-        this._pendingChunks = [];  // {resampled: Float32Array, raw: Float32Array}[]
+        this._pendingChunks = [];  // {resampled, raw, meta, timings}[]
 
         // Monitoring metrics
         this._firstChunkTime = 0;
@@ -52,6 +52,9 @@ export class AudioPlayer {
          * gapInfo shape: { gap_idx, gap_ms, total_shift_ms, chunk_idx, turn }
          */
         this.onGap = null;
+
+        /** Component timing callback: (data) => void */
+        this.onLatency = null;
 
         /**
          * Raw audio callback for session recording.
@@ -111,10 +114,12 @@ export class AudioPlayer {
      * Enqueue a SPEAK audio chunk for playback.
      * @param {string} base64Data - Base64-encoded Float32 audio at outputSampleRate
      * @param {number} [arrivalTime] - performance.now() timestamp of arrival
+     * @param {object} [meta] - server trace correlation metadata
      */
-    playChunk(base64Data, arrivalTime) {
+    playChunk(base64Data, arrivalTime, meta = {}) {
         if (!base64Data || !this._ctx) return;
         const t0 = performance.now();
+        const decodeT0 = performance.now();
 
         const binary = atob(base64Data);
         const len = binary.length;
@@ -125,8 +130,11 @@ export class AudioPlayer {
         }
         const samples = new Float32Array(bytes.buffer);
         if (samples.length === 0) return;
+        const decodeMs = performance.now() - decodeT0;
 
+        const resampleT0 = performance.now();
         const resampled = resampleAudio(samples, this._outputSR_expected, this._outputSR);
+        const resampleMs = performance.now() - resampleT0;
         const raw = this.onRawAudio ? samples : null;
         this._enqueueCount++;
 
@@ -136,11 +144,11 @@ export class AudioPlayer {
         this._lastArrivalTime = arrivalTime || t0;
 
         if (this._playing) {
-            this._scheduleChunk(resampled, raw);
+            this._scheduleChunk(resampled, raw, meta, { decodeMs, resampleMs });
             this._lastAheadMs = (this._nextTime - this._ctx.currentTime) * 1000;
             this._emitMetrics();
         } else {
-            this._pendingChunks.push({ resampled, raw });
+            this._pendingChunks.push({ resampled, raw, meta, timings: { decodeMs, resampleMs } });
             const delayMs = this._getDelayMs();
             if (!this._delayTimer) {
                 if (delayMs <= 0) {
@@ -181,7 +189,7 @@ export class AudioPlayer {
 
         this._nextTime = this._ctx.currentTime;
         for (const chunk of this._pendingChunks) {
-            this._scheduleChunk(chunk.resampled, chunk.raw);
+            this._scheduleChunk(chunk.resampled, chunk.raw, chunk.meta, chunk.timings);
         }
         this._pendingChunks = [];
 
@@ -193,7 +201,8 @@ export class AudioPlayer {
         console.log(`[AudioPlayer] playback started (buffered=${this._lastAheadMs.toFixed(0)}ms, pdelay=${pdelay.toFixed(0)}ms)`);
     }
 
-    _scheduleChunk(samples, rawSamples) {
+    _scheduleChunk(samples, rawSamples, meta = {}, timings = {}) {
+        const scheduleT0 = performance.now();
         const buffer = this._ctx.createBuffer(1, samples.length, this._outputSR);
         buffer.getChannelData(0).set(samples);
         const source = this._ctx.createBufferSource();
@@ -214,6 +223,11 @@ export class AudioPlayer {
                         total_shift_ms: this._totalShiftMs,
                         chunk_idx: this._enqueueCount,
                         turn: this._turnIdx,
+                        trace_id: meta.traceId,
+                        unit_id: meta.unitId,
+                        output_seq: meta.outputSeq,
+                        playback_ahead_ms: -gapMs,
+                        server_metrics: meta.serverMetrics || null,
                     };
                     setTimeout(() => this.onGap(info), 0);
                 }
@@ -229,6 +243,23 @@ export class AudioPlayer {
 
         source.start(this._nextTime);
         this._nextTime += buffer.duration;
+
+        if (this.onLatency) {
+            this.onLatency({
+                event: 'client.audio.chunk',
+                trace_id: meta.traceId,
+                unit_id: meta.unitId,
+                output_seq: meta.outputSeq,
+                decode_ms: timings.decodeMs || 0,
+                resample_ms: timings.resampleMs || 0,
+                schedule_ms: performance.now() - scheduleT0,
+                pcm_samples: samples.length,
+                pcm_duration_ms: samples.length / this._outputSR * 1000,
+                actual_sample_rate: this._outputSR,
+                playback_ahead_ms: (this._nextTime - this._ctx.currentTime) * 1000,
+                server_metrics: meta.serverMetrics || null,
+            });
+        }
 
         this._sources.push(source);
         source.onended = () => {

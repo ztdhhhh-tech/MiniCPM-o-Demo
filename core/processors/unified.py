@@ -112,6 +112,7 @@ import base64
 
 import numpy as np
 import torch
+from core.telemetry import LatencyCollector
 
 from core.capabilities import ProcessorMode
 from core.processors.base import BaseProcessor, MiniCPMOProcessorMixin
@@ -907,6 +908,7 @@ class DuplexView:
         audio_path: Optional[str] = None,
         frame_list: Optional[List[np.ndarray]] = None,
         max_slice_nums: int = 1,
+        latency_trace: Optional[LatencyCollector] = None,
     ) -> dict:
         """预填充用户音频
         
@@ -928,11 +930,16 @@ class DuplexView:
             audio_waveform=audio_waveform,
             frame_list=frame_list,
             max_slice_nums=max_slice_nums,
+            latency_trace=latency_trace,
         )
         
         return result
     
-    def generate(self, force_listen: bool = False) -> DuplexGenerateResult:
+    def generate(
+        self,
+        force_listen: bool = False,
+        latency_trace: Optional[LatencyCollector] = None,
+    ) -> DuplexGenerateResult:
         """生成响应
         
         Args:
@@ -952,6 +959,7 @@ class DuplexView:
             text_repetition_window_size=self.config.text_repetition_window_size,
             length_penalty=self.config.length_penalty,
             force_listen_override=force_listen,
+            latency_trace=latency_trace,
         )
         
         # 转换音频
@@ -969,14 +977,15 @@ class DuplexView:
             audio_data=audio_data,
             end_of_turn=result.get("end_of_turn", False),
             current_time=result.get("current_time", 0),
-            cost_llm_ms=result.get("cost_llm", 0) * 1000 if result.get("cost_llm") else None,
-            cost_tts_prep_ms=result.get("cost_tts_prep", 0) * 1000 if result.get("cost_tts_prep") else None,
-            cost_tts_ms=result.get("cost_tts", 0) * 1000 if result.get("cost_tts") else None,
-            cost_token2wav_ms=result.get("cost_token2wav", 0) * 1000 if result.get("cost_token2wav") else None,
-            cost_all_ms=result.get("cost_all", 0) * 1000 if result.get("cost_all") else None,
+            cost_llm_ms=result.get("cost_llm", 0) * 1000 if result.get("cost_llm") is not None else None,
+            cost_tts_prep_ms=result.get("cost_tts_prep", 0) * 1000 if result.get("cost_tts_prep") is not None else None,
+            cost_tts_ms=result.get("cost_tts", 0) * 1000 if result.get("cost_tts") is not None else None,
+            cost_token2wav_ms=result.get("cost_token2wav", 0) * 1000 if result.get("cost_token2wav") is not None else None,
+            cost_all_ms=result.get("cost_all", 0) * 1000 if result.get("cost_all") is not None else None,
             n_tokens=result.get("n_tokens"),
             n_tts_tokens=result.get("n_tts_tokens"),
             usage=result.get("usage"),
+            latency=result.get("latency"),
         )
 
     def finalize(self) -> None:

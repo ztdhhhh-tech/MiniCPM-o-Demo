@@ -15,6 +15,7 @@ from core.schemas.metrics import BackendMetrics
 from core.schemas.common import Message
 from core.schemas.duplex import DuplexConfig, DuplexGenerateResult
 from core.schemas.streaming import StreamingChunk, StreamingRequest, StreamingResponse
+from core.telemetry import LatencyCollector
 
 if TYPE_CHECKING:
     from MiniCPMO45.modeling_minicpmo_unified import DuplexPrepareResult
@@ -166,10 +167,15 @@ class PyTorchBackend:
         """Return a sampled PyTorch backend metric snapshot."""
         if self.processor is None:
             return BackendMetrics(backend="pytorch").to_dict()
-        return BackendMetrics(
+        metrics = BackendMetrics(
             backend="pytorch",
             kv_cache_length=int(getattr(self.processor, "kv_cache_length", 0) or 0),
         ).to_dict()
+        model = getattr(self.processor, "model", None)
+        duplex = getattr(model, "duplex", None)
+        if getattr(duplex, "_last_finalize_latency", None):
+            metrics["last_finalize_latency"] = duplex._last_finalize_latency
+        return metrics
 
     def chat_prefill(
         self,
@@ -267,17 +273,23 @@ class PyTorchBackend:
         audio_waveform: Optional[np.ndarray] = None,
         frame_list: Optional[list] = None,
         max_slice_nums: int = 1,
+        latency_trace: Optional[LatencyCollector] = None,
     ) -> Dict[str, Any]:
         duplex_view = self.processor.set_duplex_mode()
         return duplex_view.prefill(
             audio_waveform=audio_waveform,
             frame_list=frame_list,
             max_slice_nums=max_slice_nums,
+            latency_trace=latency_trace,
         )
 
-    def duplex_generate(self, force_listen: bool = False) -> DuplexGenerateResult:
+    def duplex_generate(
+        self,
+        force_listen: bool = False,
+        latency_trace: Optional[LatencyCollector] = None,
+    ) -> DuplexGenerateResult:
         duplex_view = self.processor.set_duplex_mode()
-        return duplex_view.generate(force_listen=force_listen)
+        return duplex_view.generate(force_listen=force_listen, latency_trace=latency_trace)
 
     def duplex_finalize(self) -> None:
         duplex_view = self.processor.set_duplex_mode()
