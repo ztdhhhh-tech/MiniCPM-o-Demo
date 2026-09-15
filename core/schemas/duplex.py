@@ -411,6 +411,26 @@ class DuplexPrefillRequest(BaseModel):
 # 生成结果
 # =============================================================================
 
+class DuplexTokenLatency(BaseModel):
+    """Timing breakdown for one token in the LLM generate loop."""
+
+    token_index: int
+    token_id: Optional[int] = None
+    token_type: Optional[str] = None
+    decode_ms: float = 0.0
+    item_sync_ms: float = 0.0
+    tokenizer_ms: float = 0.0
+    tokenizer_char_check_ms: float = 0.0
+    feed_wall_ms: float = 0.0
+    feed_gpu_ms: Optional[float] = None
+    token_total_ms: float = 0.0
+    feed_executed: bool = False
+    is_terminator: bool = False
+    is_listen: bool = False
+    is_tts_pad: bool = False
+    termination_reason: Optional[str] = None
+
+
 class DuplexLatencyMetrics(BaseModel):
     """Optional, backwards-compatible component latency payload."""
 
@@ -448,9 +468,9 @@ class DuplexLatencyMetrics(BaseModel):
     pcm_sample_rate: Optional[int] = None
     pcm_duration_ms: Optional[float] = None
     spans: Optional[List[Dict[str, Any]]] = None
+    token_timings: Optional[List[DuplexTokenLatency]] = None
     mode: Optional[str] = None
     metrics: Optional[Dict[str, Any]] = None
-
 
 class DuplexGenerateResult(BaseModel):
     """双工生成结果（每次 generate 返回）

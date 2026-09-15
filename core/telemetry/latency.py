@@ -79,6 +79,27 @@ class _Span:
     gpu_end: Any = None
 
 
+@dataclass
+class SpanMeasurement:
+    """A completed measurement whose GPU duration may resolve later."""
+
+    item: Optional[_Span] = None
+
+    @property
+    def duration_ms(self) -> float:
+        if self.item is None:
+            return 0.0
+        end_ns = self.item.end_ns or time.perf_counter_ns()
+        return max(0.0, (end_ns - self.item.start_ns) / 1_000_000)
+
+    @property
+    def gpu_duration_ms(self) -> Optional[float]:
+        if self.item is None:
+            return None
+        value = self.item.attrs.get("gpu_duration_ms")
+        return float(value) if value is not None else None
+
+
 class LatencyCollector:
     """Collect CPU spans and optional CUDA event spans for one unit."""
 
@@ -90,6 +111,7 @@ class LatencyCollector:
         self._metrics: Dict[str, Any] = {}
         self._gpu_spans: list[_Span] = []
         self._gpu_resolved = False
+        self._token_measurements: list[tuple[Dict[str, Any], SpanMeasurement]] = []
 
     @contextmanager
     def span(self, name: str, **attrs: Any) -> Iterator["LatencyCollector"]:
@@ -121,6 +143,50 @@ class LatencyCollector:
                     item.gpu_end.record()
                 except Exception:
                     item.gpu_end = None
+
+    @contextmanager
+    def measure(self, name: str, **attrs: Any) -> Iterator[SpanMeasurement]:
+        """Measure one operation and expose CPU/GPU durations to the caller.
+
+        GPU events are resolved only by ``finish()``; this method never calls
+        ``torch.cuda.synchronize()`` on the hot token path.
+        """
+        if not self.enabled:
+            yield SpanMeasurement()
+            return
+
+        item = _Span(name=name, start_ns=time.perf_counter_ns(), attrs=dict(attrs))
+        if self.mode == "gpu":
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    item.gpu_start = torch.cuda.Event(enable_timing=True)
+                    item.gpu_end = torch.cuda.Event(enable_timing=True)
+                    item.gpu_start.record()
+                    self._gpu_spans.append(item)
+            except Exception:
+                item.gpu_start = item.gpu_end = None
+        self._spans.append(item)
+        measurement = SpanMeasurement(item)
+        try:
+            yield measurement
+        except Exception as exc:
+            item.error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            item.end_ns = time.perf_counter_ns()
+            if item.gpu_end is not None:
+                try:
+                    item.gpu_end.record()
+                except Exception:
+                    item.gpu_end = None
+
+    def attach_token_measurement(
+        self, token_record: Dict[str, Any], measurement: Optional[SpanMeasurement]
+    ) -> None:
+        if self.enabled and measurement is not None:
+            self._token_measurements.append((token_record, measurement))
 
     def metric(self, name: str, value: Any) -> None:
         if self.enabled and value is not None:
@@ -167,6 +233,20 @@ class LatencyCollector:
             return {}
         if resolve_gpu:
             self._resolve_gpu()
+        for token_record, measurement in self._token_measurements:
+            token_record["feed_gpu_ms"] = measurement.gpu_duration_ms
+        token_timings = self._metrics.get("token_timings")
+        if isinstance(token_timings, list):
+            self._metrics.update({
+                "token_total_sum_ms": round(sum(float(t.get("token_total_ms", 0.0)) for t in token_timings), 3),
+                "decode_total_ms": round(sum(float(t.get("decode_ms", 0.0)) for t in token_timings), 3),
+                "item_sync_total_ms": round(sum(float(t.get("item_sync_ms", 0.0)) for t in token_timings), 3),
+                "tokenizer_total_ms": round(sum(float(t.get("tokenizer_ms", 0.0)) for t in token_timings), 3),
+                "tokenizer_char_check_total_ms": round(sum(float(t.get("tokenizer_char_check_ms", 0.0)) for t in token_timings), 3),
+                "feed_wall_total_ms": round(sum(float(t.get("feed_wall_ms", 0.0)) for t in token_timings), 3),
+            })
+            gpu_values = [t.get("feed_gpu_ms") for t in token_timings if t.get("feed_gpu_ms") is not None]
+            self._metrics["feed_gpu_total_ms"] = round(sum(gpu_values), 3) if gpu_values else None
         spans = []
         for item in self._spans:
             end_ns = item.end_ns or time.perf_counter_ns()

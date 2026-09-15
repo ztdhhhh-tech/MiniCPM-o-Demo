@@ -24,12 +24,29 @@ def _percentile(values: list[float], p: float) -> float | None:
 def aggregate(path: Path) -> dict[str, Any]:
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     span_values: dict[str, list[float]] = {}
+    token_values: dict[str, list[float]] = {}
+    token_total_values: list[float] = []
+    first_token_values: list[float] = []
+    loop_overhead_values: list[float] = []
     supply: list[float] = []
     gaps: list[float] = []
     for record in records:
         metrics = record.get("metrics") or {}
         latency = metrics.get("latency") or {}
         previous_finalize = metrics.get("last_finalize_latency") or {}
+        latency_metrics = latency.get("metrics") or {}
+        token_timings = latency_metrics.get("token_timings") or []
+        for index, token in enumerate(token_timings):
+            for key in ("decode_ms", "item_sync_ms", "tokenizer_ms", "tokenizer_char_check_ms", "feed_wall_ms", "feed_gpu_ms", "token_total_ms"):
+                value = token.get(key)
+                if value is not None:
+                    token_values.setdefault(key, []).append(float(value))
+            if token.get("token_total_ms") is not None:
+                token_total_values.append(float(token["token_total_ms"]))
+                if index == 0:
+                    first_token_values.append(float(token["token_total_ms"]))
+        if latency_metrics.get("llm_loop_overhead_ms") is not None:
+            loop_overhead_values.append(float(latency_metrics["llm_loop_overhead_ms"]))
         pcm_ms = metrics.get("pcm_duration_ms")
         interval_ms = metrics.get("output_interval_ms")
         if pcm_ms is not None and interval_ms and interval_ms > 0:
@@ -74,6 +91,24 @@ def aggregate(path: Path) -> dict[str, Any]:
             "count": len(gaps),
             "p95_ms": _percentile(gaps, 0.95),
             "max_ms": round(max(gaps), 3) if gaps else None,
+        },
+        "token_components": {
+            key: {
+                "count": len(values),
+                "p50_ms": _percentile(values, 0.50),
+                "p95_ms": _percentile(values, 0.95),
+                "p99_ms": _percentile(values, 0.99),
+                "mean_ms": round(statistics.fmean(values), 3),
+            }
+            for key, values in sorted(token_values.items())
+        },
+        "token_summary": {
+            "count": len(token_total_values),
+            "first_token_p50_ms": _percentile(first_token_values, 0.50),
+            "inter_token_p50_ms": _percentile(token_total_values[1:], 0.50),
+            "tokens_per_second": round(1000 / statistics.fmean(token_total_values), 3)
+            if token_total_values and statistics.fmean(token_total_values) > 0 else None,
+            "llm_loop_overhead_p50_ms": _percentile(loop_overhead_values, 0.50),
         },
     }
     return summary

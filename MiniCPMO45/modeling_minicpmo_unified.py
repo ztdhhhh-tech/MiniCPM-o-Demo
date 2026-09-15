@@ -5135,24 +5135,61 @@ class DuplexCapability:
         llm_start_time = time.time()
         llm_decode_total_ms = 0.0
         llm_feed_total_ms = 0.0
+        token_timings = []
         _token_trace = []  # [DEBUG] 记录每个 token 的详细信息
         _pending_terminator_id = None  # 延迟 feed 的终止符，和 </unit> 合并
         _chunk_has_tts_pad = False
 
-        for j in range(max_new_speak_tokens_per_chunk):
-            if j == max_new_speak_tokens_per_chunk - 1:
-                if self.ls_mode == "explicit":
-                    # 不立即 feed，记录下来和 </unit> 合并
-                    _pending_terminator_id = self.chunk_eos_token_id
-                    self.total_ids.append(self.chunk_eos_token_id)
-                    _tok_str = self.tokenizer.decode([self.chunk_eos_token_id])
-                    _token_trace.append(f"  j={j} CHUNK_EOS id={self.chunk_eos_token_id} '{_tok_str}' (deferred)")
-                    break
+        def _token_type(token_id: int) -> str:
+            if token_id == self.listen_token_id:
+                return "listen"
+            if token_id == self.tts_pad_id:
+                return "tts_pad"
+            if token_id in self.turn_terminator_token_ids:
+                return "turn_terminator"
+            if token_id in self.chunk_terminator_token_ids:
+                return "chunk_terminator"
+            if token_id in self.chunk_speak_token_ids:
+                return "chunk_speak"
+            return "text"
 
-            t_step = time.time()
+        def _append_token_timing(record: dict) -> None:
+            if trace.enabled:
+                token_timings.append(record)
+
+        for j in range(max_new_speak_tokens_per_chunk):
+            token_total_start_ns = time.perf_counter_ns() if trace.enabled else 0
+            if j == max_new_speak_tokens_per_chunk - 1 and self.ls_mode == "explicit":
+                _pending_terminator_id = self.chunk_eos_token_id
+                self.total_ids.append(self.chunk_eos_token_id)
+                tokenizer_t0 = time.perf_counter_ns() if trace.enabled else 0
+                _tok_str = self.tokenizer.decode([self.chunk_eos_token_id])
+                tokenizer_ms = (time.perf_counter_ns() - tokenizer_t0) / 1_000_000 if trace.enabled else 0.0
+                _append_token_timing({
+                    "token_index": j,
+                    "token_id": self.chunk_eos_token_id,
+                    "token_type": "chunk_terminator",
+                    "decode_ms": 0.0,
+                    "item_sync_ms": 0.0,
+                    "tokenizer_ms": tokenizer_ms,
+                    "tokenizer_char_check_ms": 0.0,
+                    "feed_wall_ms": 0.0,
+                    "feed_gpu_ms": None,
+                    "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
+                    "feed_executed": False,
+                    "is_terminator": True,
+                    "is_listen": False,
+                    "is_tts_pad": False,
+                    "termination_reason": "chunk_limit_deferred",
+                })
+                _token_trace.append(f"  j={j} CHUNK_EOS id={self.chunk_eos_token_id} '{_tok_str}' (deferred)")
+                break
+
+            decode_t0 = time.perf_counter_ns() if trace.enabled else 0
             if force_listen:
                 last_id = torch.tensor([self.listen_token_id], dtype=torch.long, device=self.device)
-                _decode_ms = 0.0
+                decode_ms = 0.0
+                token_id = self.listen_token_id
             else:
                 last_id = self.decoder.decode(
                     logits=logits,
@@ -5166,75 +5203,126 @@ class DuplexCapability:
                     text_repetition_window_size=text_repetition_window_size,
                     length_penalty=length_penalty,
                 )
-                _decode_ms = (time.time() - t_step) * 1000
-                llm_decode_total_ms += _decode_ms
+                decode_ms = (time.perf_counter_ns() - decode_t0) / 1_000_000 if trace.enabled else 0.0
+                item_t0 = time.perf_counter_ns() if trace.enabled else 0
+                decoded_token_id = int(last_id.item())
+                item_sync_ms = (time.perf_counter_ns() - item_t0) / 1_000_000 if trace.enabled else 0.0
+                token_id = decoded_token_id
+                if token_id == self.listen_token_id and not self.current_turn_ended:
+                    token_id = self.tts_bos_token_id
+                    last_id = torch.tensor([token_id], dtype=torch.long, device=self.device)
 
-                # if current turn not ended, not allowed to listen (only check when not force_listen)
-                if last_id.item() == self.listen_token_id and (not self.current_turn_ended):
-                    last_id = torch.tensor([self.tts_bos_token_id], dtype=torch.long, device=self.device)
+            if force_listen:
+                item_t0 = time.perf_counter_ns() if trace.enabled else 0
+                token_id = int(last_id.item())
+                item_sync_ms = (time.perf_counter_ns() - item_t0) / 1_000_000 if trace.enabled else 0.0
+            llm_decode_total_ms += decode_ms
+            token_type = _token_type(token_id)
+            is_listen = token_id == self.listen_token_id
+            is_tts_pad = token_id == self.tts_pad_id
+            is_terminator = token_id in self.chunk_terminator_token_ids or token_id in self.turn_terminator_token_ids
 
-            self.total_ids.append(last_id.item())
-
-            if last_id.item() == self.tts_pad_id:
+            self.total_ids.append(token_id)
+            if is_tts_pad:
                 _chunk_has_tts_pad = True
 
-            is_listen = last_id.item() == self.listen_token_id
-            _tok_str = self.tokenizer.decode([last_id.item()])
-            _is_special = last_id.item() in self.chunk_terminator_token_ids or last_id.item() in self.chunk_speak_token_ids
+            tokenizer_t0 = time.perf_counter_ns() if trace.enabled else 0
+            _tok_str = self.tokenizer.decode([token_id])
+            tokenizer_ms = (time.perf_counter_ns() - tokenizer_t0) / 1_000_000 if trace.enabled else 0.0
+            tokenizer_char_check_ms = 0.0
+            termination_reason = None
 
-            # termination condition detection
-            if last_id.item() in self.chunk_terminator_token_ids:
-                # 不立即 feed 终止符，记录下来和 </unit> 合并（省一次 LLM forward）
+            if token_id in self.chunk_terminator_token_ids:
                 if self.ls_mode == "explicit":
-                    _pending_terminator_id = last_id.item()
-                _token_trace.append(f"  j={j} TERM id={last_id.item()} '{_tok_str}' decode={_decode_ms:.1f}ms (deferred)")
+                    _pending_terminator_id = token_id
+                termination_reason = "terminator"
+                _append_token_timing({
+                    "token_index": j, "token_id": token_id, "token_type": token_type,
+                    "decode_ms": decode_ms, "item_sync_ms": item_sync_ms,
+                    "tokenizer_ms": tokenizer_ms, "tokenizer_char_check_ms": 0.0,
+                    "feed_wall_ms": 0.0, "feed_gpu_ms": None,
+                    "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
+                    "feed_executed": False, "is_terminator": True,
+                    "is_listen": is_listen, "is_tts_pad": is_tts_pad,
+                    "termination_reason": termination_reason,
+                })
+                _token_trace.append(f"  j={j} TERM id={token_id} '{_tok_str}' decode={decode_ms:.1f}ms (deferred)")
                 break
+
+            self.current_turn_ended = False
+            if j != 0:
+                char_t0 = time.perf_counter_ns() if trace.enabled else 0
+                _test_ids = total_ids_in_unit + [token_id]
+                _chunk_text = self.tokenizer.decode(_test_ids, skip_special_tokens=True)
+                tokenizer_char_check_ms = (time.perf_counter_ns() - char_t0) / 1_000_000 if trace.enabled else 0.0
+                if len(_chunk_text) >= 28:
+                    self.total_ids.pop()
+                    if self.ls_mode == "explicit":
+                        _pending_terminator_id = self.chunk_eos_token_id
+                        self.total_ids.append(self.chunk_eos_token_id)
+                    _kept_text = self.tokenizer.decode(total_ids_in_unit, skip_special_tokens=True) if total_ids_in_unit else ""
+                    termination_reason = "char_limit"
+                    _append_token_timing({
+                        "token_index": j, "token_id": token_id, "token_type": token_type,
+                        "decode_ms": decode_ms, "item_sync_ms": item_sync_ms,
+                        "tokenizer_ms": tokenizer_ms, "tokenizer_char_check_ms": tokenizer_char_check_ms,
+                        "feed_wall_ms": 0.0, "feed_gpu_ms": None,
+                        "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
+                        "feed_executed": False, "is_terminator": False,
+                        "is_listen": is_listen, "is_tts_pad": is_tts_pad,
+                        "termination_reason": termination_reason,
+                    })
+                    _token_trace.append(
+                        f"  j={j} CHAR_LIMIT len={len(_chunk_text)}>=28, rejected token id={token_id} '{_tok_str}', "
+                        f"kept len={len(_kept_text)} text='{_kept_text}' (forced chunk_eos, not fed to KV)"
+                    )
+                    break
+
+            if token_id not in self.chunk_speak_token_ids:
+                self.res_ids.append(token_id)
+                self.speak_count += 1
+
+            feed_wall_ms = 0.0
+            feed_gpu_ms = None
+            feed_executed = True
+            if trace.enabled:
+                feed_t0 = time.perf_counter_ns()
+                with trace.measure("model.generate.token.feed") as feed_measure:
+                    logits, hidden = self.decoder.feed(self.decoder.embed_token(token_id), return_logits=True)
+                feed_wall_ms = (time.perf_counter_ns() - feed_t0) / 1_000_000
+                feed_gpu_ms = feed_measure.gpu_duration_ms
             else:
-                # normal speak
-                self.current_turn_ended = False
+                feed_measure = None
+                logits, hidden = self.decoder.feed(self.decoder.embed_token(token_id), return_logits=True)
+            llm_feed_total_ms += feed_wall_ms
 
-                # 在 feed 之前检查字符长度，超限则不 feed、不记录，直接终止
-                if j != 0:
-                    _test_ids = total_ids_in_unit + [last_id.item()]
-                    _chunk_text = self.tokenizer.decode(_test_ids, skip_special_tokens=True)
-                    if len(_chunk_text) >= 28:
-                        self.total_ids.pop()
-                        if self.ls_mode == "explicit":
-                            _pending_terminator_id = self.chunk_eos_token_id
-                            self.total_ids.append(self.chunk_eos_token_id)
-                        _kept_text = self.tokenizer.decode(total_ids_in_unit, skip_special_tokens=True) if total_ids_in_unit else ""
-                        _token_trace.append(
-                            f"  j={j} CHAR_LIMIT len={len(_chunk_text)}>=20, rejected token id={last_id.item()} '{_tok_str}', "
-                            f"kept len={len(_kept_text)} text='{_kept_text}' (forced chunk_eos, not fed to KV)"
-                        )
-                        break
+            assert len(hidden.shape) == 3
+            assert hidden.shape[0] == 1
+            assert hidden.shape[1] == 1
 
-                if last_id.item() in self.chunk_speak_token_ids:
-                    pass
-                else:
-                    self.res_ids.append(last_id.item())
-                    self.speak_count += 1
+            end_of_turn = token_id in self.turn_terminator_token_ids
+            if end_of_turn:
+                self.current_turn_ended = True
 
-                t_feed = time.time()
-                logits, hidden = self.decoder.feed(self.decoder.embed_token(last_id.item()), return_logits=True)
-                _feed_ms = (time.time() - t_feed) * 1000
-                llm_feed_total_ms += _feed_ms
+            if j != 0:
+                total_hidden_in_unit.append([token_id, hidden, end_of_turn])
+                total_ids_in_unit.append(token_id)
 
-                assert len(hidden.shape) == 3
-                assert hidden.shape[0] == 1
-                assert hidden.shape[1] == 1
-
-                end_of_turn = last_id.item() in self.turn_terminator_token_ids
-
-                if end_of_turn:
-                    self.current_turn_ended = True
-
-                _kind = "SPECIAL" if _is_special else "TEXT"
-                _token_trace.append(f"  j={j} {_kind} id={last_id.item()} '{_tok_str}' decode={_decode_ms:.1f}ms feed={_feed_ms:.1f}ms")
-
-                if j != 0:
-                    total_hidden_in_unit.append([last_id.item(), hidden, end_of_turn])
-                    total_ids_in_unit.append(last_id.item())
+            token_record = {
+                "token_index": j, "token_id": token_id, "token_type": token_type,
+                "decode_ms": decode_ms, "item_sync_ms": item_sync_ms,
+                "tokenizer_ms": tokenizer_ms, "tokenizer_char_check_ms": tokenizer_char_check_ms,
+                "feed_wall_ms": feed_wall_ms, "feed_gpu_ms": feed_gpu_ms,
+                "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
+                "feed_executed": feed_executed, "is_terminator": is_terminator,
+                "is_listen": is_listen, "is_tts_pad": is_tts_pad,
+                "termination_reason": termination_reason,
+            }
+            _append_token_timing(token_record)
+            if trace.enabled:
+                trace.attach_token_measurement(token_record, feed_measure)
+            _kind = "SPECIAL" if token_type != "text" else "TEXT"
+            _token_trace.append(f"  j={j} {_kind} id={token_id} '{_tok_str}' decode={decode_ms:.1f}ms feed={feed_wall_ms:.1f}ms")
 
         # 恢复 forbidden list & 更新连续 tts_pad 状态
         if _tts_pad_suppressed:
@@ -5270,6 +5358,32 @@ class DuplexCapability:
 
         llm_end_time = time.time()
         cost_llm = llm_end_time - llm_start_time
+
+        if trace.enabled:
+            token_total_sum_ms = sum(float(item.get("token_total_ms", 0.0)) for item in token_timings)
+            token_totals = [float(item.get("token_total_ms", 0.0)) for item in token_timings]
+            sorted_totals = sorted(token_totals)
+            p95_index = min(len(sorted_totals) - 1, int(round((len(sorted_totals) - 1) * 0.95))) if sorted_totals else 0
+            trace.record("model.generate.llm_generate", cost_llm * 1000,
+                         n_llm_tokens=len(token_timings))
+            trace.record("model.generate.llm_decode", llm_decode_total_ms,
+                         n_llm_tokens=len(token_timings))
+            trace.record("model.generate.llm_feed", llm_feed_total_ms,
+                         n_llm_tokens=len(token_timings))
+            trace.update({
+                "token_timings": token_timings,
+                "n_llm_tokens": len(token_timings),
+                "token_total_sum_ms": round(token_total_sum_ms, 3),
+                "decode_total_ms": round(sum(float(item.get("decode_ms", 0.0)) for item in token_timings), 3),
+                "item_sync_total_ms": round(sum(float(item.get("item_sync_ms", 0.0)) for item in token_timings), 3),
+                "tokenizer_total_ms": round(sum(float(item.get("tokenizer_ms", 0.0)) for item in token_timings), 3),
+                "tokenizer_char_check_total_ms": round(sum(float(item.get("tokenizer_char_check_ms", 0.0)) for item in token_timings), 3),
+                "feed_wall_total_ms": round(sum(float(item.get("feed_wall_ms", 0.0)) for item in token_timings), 3),
+                "llm_loop_overhead_ms": round(max(0.0, cost_llm * 1000 - token_total_sum_ms), 3),
+                "first_token_total_ms": round(token_totals[0], 3) if token_totals else None,
+                "mean_token_total_ms": round(sum(token_totals) / len(token_totals), 3) if token_totals else None,
+                "p95_token_total_ms": round(sorted_totals[p95_index], 3) if sorted_totals else None,
+            })
 
         if is_listen:
             self.total_hidden.append([])
@@ -5371,12 +5485,6 @@ class DuplexCapability:
             self._reset_token2wav_for_new_turn()
 
         if trace.enabled:
-            trace.record("model.generate.llm_generate", cost_llm * 1000,
-                         n_llm_tokens=len(total_ids_in_unit))
-            trace.record("model.generate.llm_decode", llm_decode_total_ms,
-                         n_llm_tokens=len(total_ids_in_unit))
-            trace.record("model.generate.llm_feed", llm_feed_total_ms,
-                         n_llm_tokens=len(total_ids_in_unit))
             trace.update({
                 "token2wav_buffer_before": _buf_before,
                 "token2wav_buffer_after": _buf_after,
