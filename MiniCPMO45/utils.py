@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 from typing import Dict
@@ -2116,6 +2117,10 @@ class StreamDecoder:
         text_repetition_penalty=1.05,
         text_repetition_window_size=512,
         length_penalty=1.1,
+        latency_trace=None,
+        decode_gpu_trace=False,
+        isolate_prev_feed=False,
+        prev_feed_measurement=None,
     ):
         """
         Args:
@@ -2136,87 +2141,131 @@ class StreamDecoder:
             4. apply repetition penalty, top-k, top-p, etc. to the text tokens for the final sampling
         """
 
-        logits = logits.clone()
+        trace = latency_trace
+        trace_active = (
+            trace is not None
+            and getattr(trace, "enabled", False)
+            and bool(decode_gpu_trace)
+            and getattr(trace, "mode", "off") == "gpu"
+            and torch.cuda.is_available()
+        )
+        children: Dict[str, Any] = {}
 
-        # 0. independently check chunk_eos before sampling
-        eos_id = self.chunk_eos_id
+        @contextmanager
+        def _decode_span(name: str):
+            if not trace_active:
+                yield None
+                return
+            with trace.measure(f"decode.{name}", parent=root) as measurement:
+                children[name] = measurement
+                yield measurement
 
-        with torch.no_grad():
-            if mode == "greedy":
-                sampled_token = torch.argmax(logits[0]).item()
-            else:
-                original_probs = F.softmax(logits[0], dim=-1)
-                _validate_sampling_probs(original_probs, context="StreamDecoder.decode.initial_chunk_eos_sample")
-                sampled_token = torch.multinomial(original_probs, num_samples=1).item()
+        with (
+            trace.measure("model.generate.decode")
+            if trace_active
+            else nullcontext()
+        ) as root:
+            if trace_active and isolate_prev_feed:
+                wait_cpu_ms = prev_feed_measurement.wait_cpu() if prev_feed_measurement is not None else None
+                root.set_wait_cpu_ms(wait_cpu_ms)
+
+            with _decode_span("decode.logits_clone"):
+                logits = logits.clone()
+
+            # 0. independently check chunk_eos before sampling
+            eos_id = self.chunk_eos_id
+
+            with _decode_span("decode.initial_eos_sample"):
+                with torch.no_grad():
+                    if mode == "greedy":
+                        sampled_token = torch.argmax(logits[0]).item()
+                    else:
+                        original_probs = F.softmax(logits[0], dim=-1)
+                        _validate_sampling_probs(original_probs, context="StreamDecoder.decode.initial_chunk_eos_sample")
+                        sampled_token = torch.multinomial(original_probs, num_samples=1).item()
 
             # if sampled chunk_eos, return directly
             if sampled_token == eos_id:
                 next_token_id = torch.tensor([eos_id], device=logits.device)
                 next_token_str = self.tokenizer.decode(next_token_id)
 
+                if trace_active:
+                    trace.set_pending_decode_gpu(root, children)
                 return next_token_id
 
-        # if not sampled chunk_eos, set its logit to -inf
-        if self.forbidden_token_ids:
-            logits[:, self.forbidden_token_ids] = float("-inf")
+            # if not sampled chunk_eos, set its logit to -inf
+            with _decode_span("decode.forbidden_mask"):
+                if self.forbidden_token_ids:
+                    logits[:, self.forbidden_token_ids] = float("-inf")
 
-        # 1. apply repetition penalty
-        if text_repetition_penalty != 1.0 and len(self.generated_tokens) > 0:
-            # get recent tokens (within window size) considering special tokens and normal tokens
-            recent_tokens = self.generated_tokens[-text_repetition_window_size:]
+            # 1. apply repetition penalty
+            with _decode_span("decode.repetition_length_penalty"):
+                if text_repetition_penalty != 1.0 and len(self.generated_tokens) > 0:
+                    # get recent tokens (within window size) considering special tokens and normal tokens
+                    recent_tokens = self.generated_tokens[-text_repetition_window_size:]
 
-            # make it unique
-            recent_tokens = list(set(recent_tokens))
+                    # make it unique
+                    recent_tokens = list(set(recent_tokens))
 
-            # apply penalty to repeated tokens
-            for token_id in recent_tokens:
-                if token_id < logits.size(-1):  # ensure token_id is in vocabulary range
-                    if text_repetition_penalty > 1.0:
-                        # penalize repetition: decrease logits
-                        logits[0, token_id] /= text_repetition_penalty
+                    # apply penalty to repeated tokens
+                    for token_id in recent_tokens:
+                        if token_id < logits.size(-1):  # ensure token_id is in vocabulary range
+                            if text_repetition_penalty > 1.0:
+                                # penalize repetition: decrease logits
+                                logits[0, token_id] /= text_repetition_penalty
+                            else:
+                                # encourage repetition: increase logits
+                                logits[0, token_id] *= 1.0 / text_repetition_penalty
+
+                # 2. apply length penalty to turn_eos token
+                # higher length_penalty → suppress turn_eos → model 更不容易结束当前 turn，倾向更长输出
+                if length_penalty != 1.0:
+                    turn_eos_id = self.turn_eos_id
+                    if logits[0, turn_eos_id] > 0:
+                        logits[0, turn_eos_id] = logits[0, turn_eos_id] / length_penalty
                     else:
-                        # encourage repetition: increase logits
-                        logits[0, token_id] *= 1.0 / text_repetition_penalty
+                        logits[0, turn_eos_id] = logits[0, turn_eos_id] * length_penalty
 
-        # 2. apply length penalty to turn_eos token
-        # higher length_penalty → suppress turn_eos → model 更不容易结束当前 turn，倾向更长输出
-        if length_penalty != 1.0:
-            turn_eos_id = self.turn_eos_id
-            if logits[0, turn_eos_id] > 0:
-                logits[0, turn_eos_id] = logits[0, turn_eos_id] / length_penalty
+            with _decode_span("decode.listen_rank"):
+                if listen_prob_scale != 1.0:  # modify listen token logit separately
+                    logits[0, self.listen_id] *= listen_prob_scale
+
+                listen_rank = (logits[0] > logits[0, self.listen_id]).sum().item()
+
+            if listen_top_k is not None and listen_rank < listen_top_k:  # listen_id is in top-k, return directly
+                next_token_id = torch.tensor([self.listen_id], device=logits.device)
+                next_token_str = self.tokenizer.decode(next_token_id)
+
+                if next_token_str == "<|listen|>":
+                    self.context += " "
+                else:
+                    self.context += next_token_str
+
+                if trace_active:
+                    trace.set_pending_decode_gpu(root, children)
+                return next_token_id
+
+            with _decode_span("decode.argmax_sample" if mode == "greedy" else "decode.top_k_topp_sampling"):
+                if mode == "greedy":
+                    next_token_id = torch.argmax(logits, dim=-1)
+                elif mode == "sampling":
+                    logits = logits / temperature
+                    logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+                    probs = F.softmax(logits, dim=-1)
+                    _validate_sampling_probs(probs, context="StreamDecoder.decode.post_filter_sample")
+                    next_token_id = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    raise ValueError(f"Unsupported decode mode: {mode}")
+
+            with _decode_span("decode.final_item_sync"):
+                sampled_id = next_token_id.item()
+
+            if sampled_id not in self.special_token_ids:
+                self.generated_tokens.append(sampled_id)
             else:
-                logits[0, turn_eos_id] = logits[0, turn_eos_id] * length_penalty
+                self.generated_special_tokens.append(sampled_id)
 
-        if listen_prob_scale != 1.0:  # modify listen token logit separately
-            logits[0, self.listen_id] *= listen_prob_scale
-
-        listen_rank = (logits[0] > logits[0, self.listen_id]).sum().item()
-
-        if listen_top_k is not None and listen_rank < listen_top_k:  # listen_id is in top-k, return directly
-            next_token_id = torch.tensor([self.listen_id], device=logits.device)
-            next_token_str = self.tokenizer.decode(next_token_id)
-
-            if next_token_str == "<|listen|>":
-                self.context += " "
-            else:
-                self.context += next_token_str
+            if trace_active:
+                trace.set_pending_decode_gpu(root, children)
 
             return next_token_id
-
-        if mode == "greedy":
-            next_token_id = torch.argmax(logits, dim=-1)
-        elif mode == "sampling":
-            logits = logits / temperature
-            logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-            probs = F.softmax(logits, dim=-1)
-            _validate_sampling_probs(probs, context="StreamDecoder.decode.post_filter_sample")
-            next_token_id = torch.multinomial(probs, num_samples=1).squeeze(1)
-        else:
-            raise ValueError(f"Unsupported decode mode: {mode}")
-
-        if next_token_id.item() not in self.special_token_ids:
-            self.generated_tokens.append(next_token_id.item())
-        else:
-            self.generated_special_tokens.append(next_token_id.item())
-
-        return next_token_id

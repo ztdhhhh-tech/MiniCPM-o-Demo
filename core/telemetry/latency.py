@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Mapping, Optional
 
 
 def get_latency_mode() -> str:
@@ -36,6 +36,16 @@ def _sampled() -> bool:
         return False
     # Stable, cheap sampling per trace rather than per span.
     return (uuid.uuid4().int % 10_000) < int(rate * 10_000)
+
+
+def decode_gpu_trace_enabled() -> bool:
+    value = os.getenv("MINICPM_DECODE_GPU_TRACE", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def decode_isolate_prev_feed_enabled() -> bool:
+    value = os.getenv("MINICPM_DECODE_ISOLATE_PREV_FEED", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,7 @@ class SpanMeasurement:
     """A completed measurement whose GPU duration may resolve later."""
 
     item: Optional[_Span] = None
+    _wait_cpu_ms: Optional[float] = None
 
     @property
     def duration_ms(self) -> float:
@@ -99,6 +110,39 @@ class SpanMeasurement:
         value = self.item.attrs.get("gpu_duration_ms")
         return float(value) if value is not None else None
 
+    @property
+    def wait_cpu_ms(self) -> Optional[float]:
+        return self._wait_cpu_ms
+
+    def wait_cpu(self) -> Optional[float]:
+        """Wait on the stream for this span's completion event.
+
+        This is intentionally opt-in: normal spans stay asynchronous and are
+        resolved together by ``LatencyCollector.finish()``.
+        """
+        if self.item is None or self.item.gpu_end is None:
+            return None
+        if self._wait_cpu_ms is not None:
+            return self._wait_cpu_ms
+        try:
+            import torch
+
+            wait_start = time.perf_counter_ns()
+            self.item.gpu_end.synchronize()
+            self._wait_cpu_ms = round((time.perf_counter_ns() - wait_start) / 1_000_000, 3)
+        except Exception:
+            self._wait_cpu_ms = None
+        return self._wait_cpu_ms
+
+    def set_wait_cpu_ms(self, value: Optional[float]) -> None:
+        self._wait_cpu_ms = round(float(value), 3) if value is not None else None
+
+
+@dataclass
+class _PendingDecodeMeasurement:
+    root: SpanMeasurement
+    children: Dict[str, SpanMeasurement]
+
 
 class LatencyCollector:
     """Collect CPU spans and optional CUDA event spans for one unit."""
@@ -112,6 +156,8 @@ class LatencyCollector:
         self._gpu_spans: list[_Span] = []
         self._gpu_resolved = False
         self._token_measurements: list[tuple[Dict[str, Any], SpanMeasurement]] = []
+        self._pending_decode: Optional[_PendingDecodeMeasurement] = None
+        self._pending_decode_measurements: list[tuple[Dict[str, Any], _PendingDecodeMeasurement]] = []
 
     @contextmanager
     def span(self, name: str, **attrs: Any) -> Iterator["LatencyCollector"]:
@@ -145,7 +191,7 @@ class LatencyCollector:
                     item.gpu_end = None
 
     @contextmanager
-    def measure(self, name: str, **attrs: Any) -> Iterator[SpanMeasurement]:
+    def measure(self, name: str, parent: Optional[SpanMeasurement] = None, **attrs: Any) -> Iterator[SpanMeasurement]:
         """Measure one operation and expose CPU/GPU durations to the caller.
 
         GPU events are resolved only by ``finish()``; this method never calls
@@ -156,6 +202,8 @@ class LatencyCollector:
             return
 
         item = _Span(name=name, start_ns=time.perf_counter_ns(), attrs=dict(attrs))
+        if parent is not None and parent.item is not None:
+            item.attrs["parent_span"] = parent.item.name
         if self.mode == "gpu":
             try:
                 import torch
@@ -187,6 +235,33 @@ class LatencyCollector:
     ) -> None:
         if self.enabled and measurement is not None:
             self._token_measurements.append((token_record, measurement))
+
+    def set_pending_decode_gpu(
+        self,
+        root: SpanMeasurement,
+        children: Optional[Mapping[str, SpanMeasurement]] = None,
+    ) -> None:
+        """Stage a decode root/child pair for resolution at unit finish."""
+        if self.enabled:
+            self._pending_decode = _PendingDecodeMeasurement(root, dict(children or {}))
+
+    def attach_pending_decode_gpu(self, token_record: Dict[str, Any]) -> None:
+        """Bind the latest decode measurement to the token that produced it."""
+        if not self.enabled or self._pending_decode is None:
+            self._pending_decode = None
+            return
+        self._pending_decode_measurements.append((token_record, self._pending_decode))
+        self._pending_decode = None
+
+    def _write_pending_decode(self) -> None:
+        for token_record, pending in self._pending_decode_measurements:
+            token_record["decode_gpu_ms"] = pending.root.gpu_duration_ms
+            token_record["decode_gpu_spans"] = {
+                name: measurement.gpu_duration_ms
+                for name, measurement in pending.children.items()
+            }
+            token_record["decode_prev_feed_wait_ms"] = pending.root.wait_cpu_ms
+        self._pending_decode_measurements.clear()
 
     def metric(self, name: str, value: Any) -> None:
         if self.enabled and value is not None:
@@ -235,6 +310,7 @@ class LatencyCollector:
             self._resolve_gpu()
         for token_record, measurement in self._token_measurements:
             token_record["feed_gpu_ms"] = measurement.gpu_duration_ms
+        self._write_pending_decode()
         token_timings = self._metrics.get("token_timings")
         if isinstance(token_timings, list):
             self._metrics.update({

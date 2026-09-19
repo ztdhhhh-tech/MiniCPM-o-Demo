@@ -423,6 +423,9 @@ class DuplexTokenLatency(BaseModel):
     tokenizer_char_check_ms: float = 0.0
     feed_wall_ms: float = 0.0
     feed_gpu_ms: Optional[float] = None
+    decode_prev_feed_wait_ms: Optional[float] = None
+    decode_gpu_ms: Optional[float] = None
+    decode_gpu_spans: Optional[Dict[str, Optional[float]]] = None
     token_total_ms: float = 0.0
     feed_executed: bool = False
     is_terminator: bool = False

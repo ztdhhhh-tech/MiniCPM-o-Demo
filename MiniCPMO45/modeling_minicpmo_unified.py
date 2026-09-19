@@ -82,7 +82,7 @@ from .utils import torch_clone_recursive
 from .utils import TTSSamplingParams
 from .utils import TTSStreamingGenerator
 from .utils import StreamDecoder
-from core.telemetry import LatencyCollector
+from core.telemetry import LatencyCollector, decode_gpu_trace_enabled, decode_isolate_prev_feed_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -5139,6 +5139,9 @@ class DuplexCapability:
         _token_trace = []  # [DEBUG] 记录每个 token 的详细信息
         _pending_terminator_id = None  # 延迟 feed 的终止符，和 </unit> 合并
         _chunk_has_tts_pad = False
+        decode_gpu_trace = decode_gpu_trace_enabled()
+        isolate_prev_feed = decode_isolate_prev_feed_enabled()
+        prev_feed_measurement = getattr(self, "_last_token_feed_measurement", None)
 
         def _token_type(token_id: int) -> str:
             if token_id == self.listen_token_id:
@@ -5175,6 +5178,9 @@ class DuplexCapability:
                     "tokenizer_char_check_ms": 0.0,
                     "feed_wall_ms": 0.0,
                     "feed_gpu_ms": None,
+                    "decode_prev_feed_wait_ms": None,
+                    "decode_gpu_ms": None,
+                    "decode_gpu_spans": None,
                     "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
                     "feed_executed": False,
                     "is_terminator": True,
@@ -5202,6 +5208,10 @@ class DuplexCapability:
                     text_repetition_penalty=text_repetition_penalty,
                     text_repetition_window_size=text_repetition_window_size,
                     length_penalty=length_penalty,
+                    latency_trace=trace,
+                    decode_gpu_trace=decode_gpu_trace,
+                    isolate_prev_feed=isolate_prev_feed,
+                    prev_feed_measurement=prev_feed_measurement,
                 )
                 decode_ms = (time.perf_counter_ns() - decode_t0) / 1_000_000 if trace.enabled else 0.0
                 item_t0 = time.perf_counter_ns() if trace.enabled else 0
@@ -5241,6 +5251,8 @@ class DuplexCapability:
                     "decode_ms": decode_ms, "item_sync_ms": item_sync_ms,
                     "tokenizer_ms": tokenizer_ms, "tokenizer_char_check_ms": 0.0,
                     "feed_wall_ms": 0.0, "feed_gpu_ms": None,
+                    "decode_prev_feed_wait_ms": None, "decode_gpu_ms": None,
+                    "decode_gpu_spans": None,
                     "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
                     "feed_executed": False, "is_terminator": True,
                     "is_listen": is_listen, "is_tts_pad": is_tts_pad,
@@ -5267,6 +5279,8 @@ class DuplexCapability:
                         "decode_ms": decode_ms, "item_sync_ms": item_sync_ms,
                         "tokenizer_ms": tokenizer_ms, "tokenizer_char_check_ms": tokenizer_char_check_ms,
                         "feed_wall_ms": 0.0, "feed_gpu_ms": None,
+                        "decode_prev_feed_wait_ms": None, "decode_gpu_ms": None,
+                        "decode_gpu_spans": None,
                         "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
                         "feed_executed": False, "is_terminator": False,
                         "is_listen": is_listen, "is_tts_pad": is_tts_pad,
@@ -5294,6 +5308,7 @@ class DuplexCapability:
             else:
                 feed_measure = None
                 logits, hidden = self.decoder.feed(self.decoder.embed_token(token_id), return_logits=True)
+            self._last_token_feed_measurement = feed_measure
             llm_feed_total_ms += feed_wall_ms
 
             assert len(hidden.shape) == 3
@@ -5313,6 +5328,8 @@ class DuplexCapability:
                 "decode_ms": decode_ms, "item_sync_ms": item_sync_ms,
                 "tokenizer_ms": tokenizer_ms, "tokenizer_char_check_ms": tokenizer_char_check_ms,
                 "feed_wall_ms": feed_wall_ms, "feed_gpu_ms": feed_gpu_ms,
+                "decode_prev_feed_wait_ms": None, "decode_gpu_ms": None,
+                "decode_gpu_spans": None,
                 "token_total_ms": (time.perf_counter_ns() - token_total_start_ns) / 1_000_000 if trace.enabled else 0.0,
                 "feed_executed": feed_executed, "is_terminator": is_terminator,
                 "is_listen": is_listen, "is_tts_pad": is_tts_pad,
@@ -5320,6 +5337,7 @@ class DuplexCapability:
             }
             _append_token_timing(token_record)
             if trace.enabled:
+                trace.attach_pending_decode_gpu(token_record)
                 trace.attach_token_measurement(token_record, feed_measure)
             _kind = "SPECIAL" if token_type != "text" else "TEXT"
             _token_trace.append(f"  j={j} {_kind} id={token_id} '{_tok_str}' decode={decode_ms:.1f}ms feed={feed_wall_ms:.1f}ms")
