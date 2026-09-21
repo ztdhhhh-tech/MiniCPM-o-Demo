@@ -5309,6 +5309,11 @@ class DuplexCapability:
                 feed_measure = None
                 logits, hidden = self.decoder.feed(self.decoder.embed_token(token_id), return_logits=True)
             self._last_token_feed_measurement = feed_measure
+            # The next decode in this unit must isolate the feed that just ran.
+            # Keep the local reference in sync; otherwise every decode in the
+            # loop waits on the measurement captured before the loop (usually
+            # the previous unit's final feed).
+            prev_feed_measurement = feed_measure
             llm_feed_total_ms += feed_wall_ms
 
             assert len(hidden.shape) == 3
